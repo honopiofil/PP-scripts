@@ -1,0 +1,86 @@
+#!/bin/bash
+if [ $# -ne 2 ] ; then
+  echo "This script prepares dir and files for alignment."
+  echo "It should be executed from the inside of set's alignment dir where set's data zip file is present."
+  echo "Usage alignment_prepare.sh [path to audio dir] [path to data zip]"
+  exit 1;
+fi
+
+audio=$1
+datazip=$2
+dir=pwd
+
+cp -r /exp/Exported/kaldi_dir_ready_to_use kaldi
+
+datadir=$(tr '.zip' '' $datazip)
+echo "Set name:" $datadir 
+mkdir kaldi/data/$datadir
+
+ln -sf $audio audio
+unzip $datazip
+
+mkdir audio_mono
+echo "Executing split_audio.sh..."
+split_audio.sh audio audio_mono
+
+echo "Executing cleanup_export.py..."
+cleanup_export.py $datadir audio_mono kaldi/data/$datadir
+cp $datadir/utt2role kaldi/data/$datadir/
+
+echo "Done alignment preparation for $datadir"
+exit 0;
+
+
+
+cd ~/Desktop/SilverWhisper1/Exported.../201911/kaldi/data/201911
+cut -f2- -d' ' text | tr ' ' '\n' | sort -u > word.list
+sed -i 's|audio_quiet2|audio_mono|' wav.scp
+export LC_ALL=C
+for f in * ; do sort -o $f $f ; done
+../../utils/utt2spk_to_spk2utt.pl utt2spk > spk2utt
+for f in * ; do sort -o $f $f ; done
+cd ../.. 	# ~/Desktop/SilverWhisper1/Exported_ready_for_test_no_problematic/201911/kaldi
+./utils/validate_data_dir.sh --no-feats data/201911
+./steps/make_mfcc.sh --nj 10 data/201911
+cd data
+python3 ~/Desktop/SilverWhisper1/Scripts/get_beeps.py audio_mono 201911/beeps_ctm
+mkdir audio_quiet
+python3 ~/Desktop/SilverWhisper1/Scripts/quiet_files.py -b 201911/beeps_ctm audio_mono audio_quiet
+rm -rf 201911/data/ 201911/log/ && cp -r 201911 201911_hires && cd ..
+./utils/validate_data_dir.sh --no-feats data/201911_hires/
+cd data/201911_hires/	# ~/Desktop/SilverWhisper1/Exported_ready_for_test_no_problematic/201911/kaldi/data/201911_hires/
+sed -i 's|audio_mono|audio_quiet|' wav.scp
+cd ../.. 	# ~/Desktop/SilverWhisper1/Exported_ready_for_test_no_problematic/201911/kaldi
+./steps/make_mfcc.sh --nj 10 --mfcc-config conf/mfcc_hires.conf data/201911_hires
+./steps/compute_cmvn_stats.sh ./data/201911_hires
+./steps/segmentation/detect_speech_activity.sh --cmd run.pl --nj 10 --extra-left-context 79 --extra-right-context 21 --extra-left-context-initial 0 --extra-right-context-final 0 --frames-per-chunk 150 --mfcc-config conf/mfcc_hires.conf data/201911_hires exp/segmentation_1a/tdnn_stats_asr_sad_1a data/201911_hires/data exp/vad data/201911_vad
+# (ponizej trzeba uwzglednic dobry skrypt - old?)
+./local_clarin/clarin_prepare_dict_old.sh data/201911/word.list data/dict
+./utils/prepare_lang.sh data/dict/ "<unk>" data/tmp data/lang
+
+
+*************************tu alignment z RESEGMENTACJA *******************
+ścieżka z segmentacją na podst. vad:
+cd data
+mkdir audio_extracted
+extract_segments_audio.py q7_vad_seg/segments q7_vad_seg/segments_new audio_quiet audio_extracted
+mkdir q7_whole
+cd ..
+./utils/data/convert_data_dir_to_whole.sh data/q7_hires data/q7_whole
+cd data/q7_whole
+sed -i 's|audio_quiet|audio_extracted|' wav.scp
+cd ../..
+./steps/make_mfcc.sh --nj 10 --mfcc-config conf/mfcc.conf data/q7_whole
+./steps/compute_cmvn_stats.sh data/q7_whole
+./steps/align_fmllr.sh --nj 44 --beam 100 --retry_beam 300 data/q7_whole data/lang exp/tri3b_adapt exp/ali
+# weryfikacja ile przerobilo poprawnie:
+grep Done exp/ali/log/align_pass2.*.log | cut -d' ' -f 4,7 | sed 's|\,||' | numsum -c | tr ' ' '//' | xargs echo "Done/errors: "
+./steps/get_train_ctm.sh data/q7_whole data/lang exp/ali
+# czy w programie zależnym utils/data/internal/combine_segments_to_recording.py jest poprawiona konwersja na float?
+ctm_resegment.py exp/ali/ctm exp/ali/ctm_resegmented data/q7_vad_seg/segments_new data/q7_vad_seg/segments
+cd exp/ali
+generate_final_seg.py ./ctm_resegmented ../../data/q7/beeps_ctm ../../data/q7/segments ../../data/q7/utt2role ./final_ctm
+/exp/PP-scripts/remove_single_ch.sh ctm_resegmented final_ctm final_ctm_filtered
+
+mkdir tg
+python3 ~/Desktop/SilverWhisper1/Scripts/ctm_to_tgs.py -g ctm_resegmented tg
